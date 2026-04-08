@@ -1,4 +1,4 @@
-#Folder Contents Outline
+Folder Contents Outline
 
 Taylors Code - Adam Optimization contains:
 - "ADAMOptimizer.py": Code for the ADAM optimizer, k-fold CV, and hyperparameter tuning procedure
