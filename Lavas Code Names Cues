@@ -1,0 +1,837 @@
+import os
+import re
+import zipfile
+import unicodedata
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from scipy.stats import ttest_ind, spearmanr
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    classification_report,
+    mean_squared_error,
+    r2_score
+)
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+
+# ============================================================
+# 1. SETTINGS
+# ============================================================
+
+ZIP_PATH = "pollbypoll_bureauparbureauCanada (1).zip"
+
+META_COLS = [
+    "Electoral District Number/Numéro de circonscription",
+    "Electoral District Name/Nom de circonscription",
+    "Polling Division Number/Numéro de section de vote",
+    "Polling Division Name/Nom de section de vote",
+    "Rejected Ballots/Bulletins rejetés",
+    "Total Votes/Total des votes",
+    "Electors/Électeurs",
+]
+
+ED_NUM_COL = "Electoral District Number/Numéro de circonscription"
+ED_NAME_COL = "Electoral District Name/Nom de circonscription"
+PD_NUM_COL = "Polling Division Number/Numéro de section de vote"
+PD_NAME_COL = "Polling Division Name/Nom de section de vote"
+REJECTED_COL = "Rejected Ballots/Bulletins rejetés"
+TOTAL_VOTES_COL = "Total Votes/Total des votes"
+ELECTORS_COL = "Electors/Électeurs"
+
+
+# ============================================================
+# 2. BASIC HELPERS
+# ============================================================
+
+def normalize_text(x):
+    if pd.isna(x):
+        return np.nan
+    x = str(x)
+    x = unicodedata.normalize("NFKD", x)
+    x = "".join(ch for ch in x if not unicodedata.combining(ch))
+    x = x.lower().strip()
+    x = x.replace("—", "-").replace("–", "-").replace("’", "'").replace("`", "'")
+    x = x.replace("/", " ")
+    x = x.replace("-", " ")
+    x = x.replace("'", " ")
+    x = re.sub(r"[^a-z0-9\s]", " ", x)
+    x = re.sub(r"\s+", " ", x).strip()
+    return x
+
+
+def has_accented_characters(text):
+    if pd.isna(text):
+        return 0
+    text = str(text)
+    normalized = unicodedata.normalize("NFD", text)
+    return int(any(unicodedata.combining(ch) for ch in normalized))
+
+
+def uppercase_ratio(s):
+    s = "" if pd.isna(s) else str(s)
+    letters = [ch for ch in s if ch.isalpha()]
+    if len(letters) == 0:
+        return 0.0
+    return sum(ch.isupper() for ch in letters) / len(letters)
+
+
+def vowel_ratio(s):
+    s = "" if pd.isna(s) else str(s).lower()
+    letters = [ch for ch in s if ch.isalpha()]
+    if len(letters) == 0:
+        return 0.0
+    vowels = sum(ch in "aeiou" for ch in letters)
+    return vowels / len(letters)
+
+
+def safe_split_name(full_name):
+    full_name = "" if pd.isna(full_name) else str(full_name).strip()
+    parts = full_name.split()
+    if len(parts) == 0:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], " ".join(parts[1:])
+
+
+def cohens_d(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    x = x[~np.isnan(x)]
+    y = y[~np.isnan(y)]
+
+    if len(x) < 2 or len(y) < 2:
+        return np.nan
+
+    nx, ny = len(x), len(y)
+    sx, sy = np.var(x, ddof=1), np.var(y, ddof=1)
+
+    pooled_std = np.sqrt(((nx - 1) * sx + (ny - 1) * sy) / (nx + ny - 2))
+    if pooled_std == 0:
+        return np.nan
+
+    return (np.mean(x) - np.mean(y)) / pooled_std
+
+
+# ============================================================
+# 3. PLOTTING
+# ============================================================
+
+def plot_horizontal_bar(labels, values, title, xlabel):
+    order = np.argsort(values)
+    labels = np.array(labels)[order]
+    values = np.array(values)[order]
+
+    plt.figure(figsize=(9, 6))
+    bars = plt.barh(labels, values)
+    plt.title(title, fontsize=14)
+    plt.xlabel(xlabel)
+
+    for bar, val in zip(bars, values):
+        plt.text(val, bar.get_y() + bar.get_height() / 2, f" {val:.3f}", va="center")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_two_bar(values, labels, title, ylabel):
+    plt.figure(figsize=(7, 4.5))
+    bars = plt.bar(labels, values)
+    plt.title(title, fontsize=14)
+    plt.ylabel(ylabel)
+
+    for bar, val in zip(bars, values):
+        plt.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f"{val:.3f}",
+            ha="center",
+            va="bottom"
+        )
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_grouped_bar(categories, vals1, vals2, label1, label2, title, ylabel):
+    x = np.arange(len(categories))
+    width = 0.35
+
+    plt.figure(figsize=(10, 5))
+    bars1 = plt.bar(x - width / 2, vals1, width, label=label1)
+    bars2 = plt.bar(x + width / 2, vals2, width, label=label2)
+
+    plt.xticks(x, categories, rotation=30, ha="right")
+    plt.ylabel(ylabel)
+    plt.title(title, fontsize=14)
+    plt.legend()
+
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            h = bar.get_height()
+            plt.text(
+                bar.get_x() + bar.get_width() / 2,
+                h,
+                f"{h:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=9
+            )
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_conf_matrix_pretty(cm, class_names, title="Confusion Matrix"):
+    plt.figure(figsize=(6.5, 5.5))
+    plt.imshow(cm, interpolation="nearest", cmap="viridis")
+    plt.title(title, fontsize=14)
+    plt.colorbar()
+
+    tick_marks = np.arange(len(class_names))
+    plt.xticks(tick_marks, class_names, rotation=30, ha="right")
+    plt.yticks(tick_marks, class_names)
+
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=11)
+
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_boxplots(df, vars_to_plot, group_col):
+    for var in vars_to_plot:
+        subset = df[[group_col, var]].dropna().copy()
+        groups = []
+        labels = []
+
+        for g in subset[group_col].unique():
+            groups.append(subset.loc[subset[group_col] == g, var].values)
+            labels.append(g)
+
+        plt.figure(figsize=(6, 4.5))
+        plt.boxplot(groups, tick_labels=labels)
+        plt.title(f"{var} by {group_col}")
+        plt.ylabel(var)
+        plt.tight_layout()
+        plt.show()
+
+
+# ============================================================
+# 4. READ ALL CSVs FROM ZIP
+# ============================================================
+
+def read_all_poll_csvs_from_zip(zip_path):
+    if not os.path.exists(zip_path):
+        raise FileNotFoundError(f"Could not find zip file: {zip_path}")
+
+    all_dfs = []
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        csv_names = [name for name in zf.namelist() if name.lower().endswith(".csv")]
+        print(f"Found {len(csv_names)} poll CSV files in ZIP")
+
+        for i, name in enumerate(csv_names, start=1):
+            with zf.open(name) as f:
+                df = pd.read_csv(f)
+                df["source_file"] = os.path.basename(name)
+                all_dfs.append(df)
+
+            if i % 50 == 0 or i == len(csv_names):
+                print(f"Processed {i} / {len(csv_names)} files")
+
+    return all_dfs
+
+
+# ============================================================
+# 5. BUILD CANDIDATE-LEVEL DATASET
+# ============================================================
+
+def candidate_columns(df):
+    return [
+        c for c in df.columns
+        if c not in META_COLS and c != "source_file"
+    ]
+
+
+def aggregate_candidate_level_from_poll_df(df):
+    cand_cols = candidate_columns(df)
+
+    riding_num = df[ED_NUM_COL].iloc[0]
+    riding_name = df[ED_NAME_COL].iloc[0]
+    total_votes_riding = pd.to_numeric(df[TOTAL_VOTES_COL], errors="coerce").sum()
+    electors_riding = pd.to_numeric(df[ELECTORS_COL], errors="coerce").sum()
+    rejected_riding = pd.to_numeric(df[REJECTED_COL], errors="coerce").sum()
+
+    rows = []
+    for cand in cand_cols:
+        votes = pd.to_numeric(df[cand], errors="coerce").fillna(0).sum()
+
+        rows.append({
+            "district_number": riding_num,
+            "riding_name": riding_name,
+            "candidate_name": cand,
+            "candidate_votes": votes,
+            "riding_total_votes": total_votes_riding,
+            "riding_total_electors": electors_riding,
+            "riding_rejected_ballots": rejected_riding
+        })
+
+    out = pd.DataFrame(rows)
+
+    out["vote_share"] = out["candidate_votes"] / out["riding_total_votes"]
+    out["turnout_pct"] = out["riding_total_votes"] / out["riding_total_electors"]
+    out["rejected_ballot_pct"] = out["riding_rejected_ballots"] / (
+        out["riding_total_votes"] + out["riding_rejected_ballots"]
+    )
+
+    out = out.sort_values(["district_number", "candidate_votes"], ascending=[True, False]).copy()
+    out["rank_in_riding"] = out.groupby("district_number")["candidate_votes"].rank(
+        method="dense", ascending=False
+    )
+    out["is_winner"] = (out["rank_in_riding"] == 1).astype(int)
+
+    if out["candidate_votes"].sum() > 0:
+        top_votes = out["candidate_votes"].max()
+        second_votes = out["candidate_votes"].nlargest(2).iloc[-1] if len(out) > 1 else 0
+        margin = (top_votes - second_votes) / total_votes_riding if total_votes_riding > 0 else np.nan
+    else:
+        margin = np.nan
+
+    out["riding_margin_of_victory"] = margin
+
+    return out
+
+
+def build_all_candidate_dataset(zip_path):
+    poll_dfs = read_all_poll_csvs_from_zip(zip_path)
+    candidate_level_list = [aggregate_candidate_level_from_poll_df(df) for df in poll_dfs]
+    cand_df = pd.concat(candidate_level_list, ignore_index=True)
+
+    print("\n===== CANDIDATE-LEVEL DATASET =====")
+    print("Rows:", cand_df.shape[0])
+    print("Columns:", cand_df.shape[1])
+    print(cand_df.head())
+
+    cand_df.to_csv("candidate_level_from_poll_zip.csv", index=False)
+    return cand_df
+
+
+# ============================================================
+# 6. ADD SAFE NAME-CUE FEATURES
+# ============================================================
+
+def add_name_cue_features(cand_df):
+    df = cand_df.copy()
+
+    split_names = df["candidate_name"].apply(safe_split_name)
+    df["first_name"] = split_names.apply(lambda x: x[0])
+    df["last_name"] = split_names.apply(lambda x: x[1])
+
+    df["cue_first_name_len"] = df["first_name"].str.len()
+    df["cue_last_name_len"] = df["last_name"].str.len()
+    df["cue_full_name_len"] = df["candidate_name"].str.len()
+
+    df["cue_first_name_word_count"] = df["first_name"].str.split().apply(len)
+    df["cue_last_name_word_count"] = df["last_name"].str.split().apply(len)
+    df["cue_full_name_word_count"] = df["candidate_name"].str.split().apply(len)
+
+    df["cue_has_hyphen"] = df["candidate_name"].str.contains("-", regex=False).astype(int)
+    df["cue_has_apostrophe"] = df["candidate_name"].str.contains("'", regex=False).astype(int)
+    df["cue_has_period"] = df["candidate_name"].str.contains(".", regex=False).astype(int)
+    df["cue_has_accent"] = df["candidate_name"].apply(has_accented_characters)
+    df["cue_uppercase_ratio"] = df["candidate_name"].apply(uppercase_ratio)
+    df["cue_vowel_ratio"] = df["candidate_name"].apply(vowel_ratio)
+
+    def same_initial(row):
+        f = row["first_name"]
+        l = row["last_name"]
+        if pd.isna(f) or pd.isna(l) or len(f) == 0 or len(l) == 0:
+            return 0
+        return int(f[0].lower() == l[0].lower())
+
+    df["cue_same_initial"] = df.apply(same_initial, axis=1)
+
+    df["cue_first_name_is_initial_like"] = df["first_name"].str.fullmatch(
+        r"[A-Za-z]\.?", na=False
+    ).astype(int)
+
+    return df
+
+
+def cue_cols(df):
+    return [c for c in df.columns if c.startswith("cue_")]
+
+
+# ============================================================
+# 7. DESCRIPTIVE ANALYSES
+# ============================================================
+
+def winner_vs_loser_summary(df):
+    rows = []
+    for col in cue_cols(df):
+        winners = pd.to_numeric(df.loc[df["is_winner"] == 1, col], errors="coerce").dropna()
+        losers = pd.to_numeric(df.loc[df["is_winner"] == 0, col], errors="coerce").dropna()
+
+        if len(winners) < 5 or len(losers) < 5:
+            continue
+
+        t_stat, p_val = ttest_ind(winners, losers, equal_var=False, nan_policy="omit")
+        d = cohens_d(winners, losers)
+
+        rows.append({
+            "variable": col,
+            "winner_mean": winners.mean(),
+            "loser_mean": losers.mean(),
+            "difference": winners.mean() - losers.mean(),
+            "p_value": p_val,
+            "cohens_d": d
+        })
+
+    summary = pd.DataFrame(rows).sort_values("p_value")
+    print("\n===== WINNER VS LOSER SUMMARY =====")
+    print(summary.to_string(index=False))
+    summary.to_csv("candidate_cue_winner_vs_loser_summary.csv", index=False)
+    return summary
+
+
+def vote_share_correlation_summary(df):
+    rows = []
+    for col in cue_cols(df):
+        x = pd.to_numeric(df[col], errors="coerce")
+        y = pd.to_numeric(df["vote_share"], errors="coerce")
+        mask = x.notna() & y.notna()
+
+        if mask.sum() < 20:
+            continue
+
+        rho, p = spearmanr(x[mask], y[mask])
+
+        rows.append({
+            "variable": col,
+            "spearman_rho": rho,
+            "p_value": p,
+            "abs_rho": abs(rho) if pd.notna(rho) else np.nan
+        })
+
+    summary = pd.DataFrame(rows).sort_values("abs_rho", ascending=False)
+    print("\n===== VOTE SHARE CORRELATION SUMMARY =====")
+    print(summary.to_string(index=False))
+    summary.to_csv("candidate_cue_vote_share_correlations.csv", index=False)
+    return summary
+
+
+def within_riding_rank_summary(df):
+    rows = []
+    for col in cue_cols(df):
+        x = pd.to_numeric(df[col], errors="coerce")
+        y = pd.to_numeric(df["rank_in_riding"], errors="coerce")
+        mask = x.notna() & y.notna()
+
+        if mask.sum() < 20:
+            continue
+
+        rho, p = spearmanr(x[mask], y[mask])
+
+        rows.append({
+            "variable": col,
+            "spearman_rho_with_rank": rho,
+            "p_value": p,
+            "abs_rho": abs(rho) if pd.notna(rho) else np.nan
+        })
+
+    summary = pd.DataFrame(rows).sort_values("abs_rho", ascending=False)
+    print("\n===== WITHIN-RIDING RANK SUMMARY =====")
+    print(summary.to_string(index=False))
+    summary.to_csv("candidate_cue_rank_correlations.csv", index=False)
+    return summary
+
+
+def make_descriptive_plots(df, winner_summary, corr_summary):
+    if not winner_summary.empty:
+        top = winner_summary.head(8)
+        plot_horizontal_bar(
+            labels=top["variable"].tolist(),
+            values=top["difference"].abs().tolist(),
+            title="Winner vs Loser: Top Candidate-Cue Differences",
+            xlabel="Absolute mean difference"
+        )
+
+    if not corr_summary.empty:
+        top = corr_summary.head(8)
+        plot_horizontal_bar(
+            labels=top["variable"].tolist(),
+            values=top["abs_rho"].fillna(0).tolist(),
+            title="Top Candidate-Cue Correlations with Vote Share",
+            xlabel="Absolute Spearman correlation"
+        )
+
+    vars_for_boxplots = []
+    if not winner_summary.empty:
+        vars_for_boxplots = winner_summary.head(4)["variable"].tolist()
+
+    if vars_for_boxplots:
+        tmp = df.copy()
+        tmp["winner_label"] = np.where(tmp["is_winner"] == 1, "Winner", "Loser")
+        plot_boxplots(tmp, vars_for_boxplots, "winner_label")
+
+
+def run_descriptive_candidate_cue_analysis(df, label="ALL CANDIDATES"):
+    print(f"\n================ DESCRIPTIVE ANALYSIS: {label} ================\n")
+
+    winner_summary = winner_vs_loser_summary(df)
+    corr_summary = vote_share_correlation_summary(df)
+    rank_summary = within_riding_rank_summary(df)
+
+    make_descriptive_plots(df, winner_summary, corr_summary)
+
+    return winner_summary, corr_summary, rank_summary
+
+
+# ============================================================
+# 8. MODELING
+# ============================================================
+
+def screen_cues_on_training(train_df):
+    rows = []
+    for col in cue_cols(train_df):
+        x = pd.to_numeric(train_df[col], errors="coerce")
+        y = pd.to_numeric(train_df["vote_share"], errors="coerce")
+        mask = x.notna() & y.notna()
+
+        if mask.sum() < 20:
+            continue
+
+        rho, p = spearmanr(x[mask], y[mask])
+
+        rows.append({
+            "variable": col,
+            "spearman_rho": rho,
+            "p_value": p,
+            "abs_rho": abs(rho) if pd.notna(rho) else np.nan
+        })
+
+    screened = pd.DataFrame(rows).sort_values("abs_rho", ascending=False)
+    print("\n===== TOP SCREENED NAME CUES (TRAINING ONLY) =====")
+    print(screened.to_string(index=False))
+    screened.to_csv("candidate_cue_training_screening.csv", index=False)
+    return screened
+
+
+def build_baseline_X(df):
+    cols = [
+        "riding_total_votes",
+        "riding_total_electors",
+        "turnout_pct",
+        "rejected_ballot_pct",
+        "riding_margin_of_victory"
+    ]
+    return df[cols].copy()
+
+
+def build_with_cues_X(df, chosen_cues):
+    cols = [
+        "riding_total_votes",
+        "riding_total_electors",
+        "turnout_pct",
+        "rejected_ballot_pct",
+        "riding_margin_of_victory"
+    ] + chosen_cues
+    return df[cols].copy()
+
+
+def run_vote_share_regression(df):
+    train_df, test_df = train_test_split(df, test_size=0.25, random_state=42)
+
+    screened = screen_cues_on_training(train_df)
+    top5 = screened.head(5)["variable"].tolist()
+    print("\nSelected top 5 candidate cues:")
+    print(top5)
+
+    X_train_base = build_baseline_X(train_df)
+    X_test_base = build_baseline_X(test_df)
+
+    X_train_cue = build_with_cues_X(train_df, top5)
+    X_test_cue = build_with_cues_X(test_df, top5)
+
+    y_train = train_df["vote_share"].values
+    y_test = test_df["vote_share"].values
+
+    def fit_eval(Xtr, Xte, ytr, yte, label):
+        pipe = Pipeline([
+            ("scaler", StandardScaler()),
+            ("lr", LinearRegression())
+        ])
+        pipe.fit(Xtr, ytr)
+        pred_tr = pipe.predict(Xtr)
+        pred_te = pipe.predict(Xte)
+
+        rmse_tr = np.sqrt(mean_squared_error(ytr, pred_tr))
+        rmse_te = np.sqrt(mean_squared_error(yte, pred_te))
+        r2_tr = r2_score(ytr, pred_tr)
+        r2_te = r2_score(yte, pred_te)
+
+        print(f"\n===== {label} =====")
+        print("Train RMSE:", round(rmse_tr, 4))
+        print("Test RMSE:", round(rmse_te, 4))
+        print("Train R^2:", round(r2_tr, 4))
+        print("Test R^2:", round(r2_te, 4))
+
+        return {
+            "Model": label,
+            "Train RMSE": rmse_tr,
+            "Test RMSE": rmse_te,
+            "Train R2": r2_tr,
+            "Test R2": r2_te
+        }
+
+    base_res = fit_eval(X_train_base, X_test_base, y_train, y_test, "Vote Share Baseline")
+    cue_res = fit_eval(X_train_cue, X_test_cue, y_train, y_test, "Vote Share + Top 5 Candidate Cues")
+
+    comp = pd.DataFrame([base_res, cue_res])
+    print("\n===== VOTE SHARE REGRESSION COMPARISON =====")
+    print(comp.to_string(index=False))
+    comp.to_csv("candidate_cue_vote_share_model_comparison.csv", index=False)
+
+    plot_two_bar(
+        values=comp["Test R2"].tolist(),
+        labels=comp["Model"].tolist(),
+        title="Vote Share Regression: Test R^2 Comparison",
+        ylabel="Test R^2"
+    )
+
+    return screened, comp, top5
+
+
+def run_winner_classification(df, top5):
+    train_df, test_df = train_test_split(
+        df,
+        test_size=0.25,
+        stratify=df["is_winner"],
+        random_state=42
+    )
+
+    X_train_base = build_baseline_X(train_df)
+    X_test_base = build_baseline_X(test_df)
+
+    X_train_cue = build_with_cues_X(train_df, top5)
+    X_test_cue = build_with_cues_X(test_df, top5)
+
+    y_train = train_df["is_winner"].values
+    y_test = test_df["is_winner"].values
+
+    def fit_eval(Xtr, Xte, ytr, yte, label):
+        pipe = Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=2000))
+        ])
+        pipe.fit(Xtr, ytr)
+        pred_tr = pipe.predict(Xtr)
+        pred_te = pipe.predict(Xte)
+
+        train_acc = accuracy_score(ytr, pred_tr)
+        test_acc = accuracy_score(yte, pred_te)
+        cm = confusion_matrix(yte, pred_te)
+
+        print(f"\n===== {label} =====")
+        print("Train Accuracy:", round(train_acc, 4))
+        print("Test Accuracy:", round(test_acc, 4))
+        print("\nConfusion Matrix:")
+        print(cm)
+        print("\nClassification Report:")
+        print(classification_report(yte, pred_te, zero_division=0))
+
+        plot_conf_matrix_pretty(cm, ["Loser", "Winner"], label + " Confusion Matrix")
+
+        return {
+            "Model": label,
+            "Train Accuracy": train_acc,
+            "Test Accuracy": test_acc
+        }
+
+    base_res = fit_eval(X_train_base, X_test_base, y_train, y_test, "Winner Baseline")
+    cue_res = fit_eval(X_train_cue, X_test_cue, y_train, y_test, "Winner + Top 5 Candidate Cues")
+
+    comp = pd.DataFrame([base_res, cue_res])
+    print("\n===== WINNER CLASSIFICATION COMPARISON =====")
+    print(comp.to_string(index=False))
+    comp.to_csv("candidate_cue_winner_classification_comparison.csv", index=False)
+
+    plot_two_bar(
+        values=comp["Test Accuracy"].tolist(),
+        labels=comp["Model"].tolist(),
+        title="Winner Classification: Test Accuracy Comparison",
+        ylabel="Test Accuracy"
+    )
+
+    return comp
+
+
+def run_candidate_models(df, label="ALL CANDIDATES"):
+    print(f"\n================ MODELING: {label} ================\n")
+
+    if df["is_winner"].nunique() < 2:
+        print("Not enough class variation for winner classification.")
+        return None, None, None
+
+    if df["district_number"].nunique() < 10:
+        print("Too few ridings for stable modeling.")
+        return None, None, None
+
+    screened, reg_comp, top5 = run_vote_share_regression(df)
+    class_comp = run_winner_classification(df, top5)
+
+    print(f"\nTop 5 cues for {label}: {top5}")
+
+    return screened, reg_comp, class_comp
+
+
+# ============================================================
+# 9. CLOSE-RACE ANALYSIS
+# ============================================================
+
+def subset_close_races(df, threshold=0.05):
+    out = df[df["riding_margin_of_victory"] < threshold].copy()
+    print(f"\nRows in close-race subset (margin < {threshold:.0%}): {out.shape[0]}")
+    print(f"Unique ridings in close-race subset: {out['district_number'].nunique()}")
+    return out
+
+
+def run_close_race_candidate_cue_analysis(df):
+    print("\n================ CLOSE-RACE ANALYSIS =================\n")
+
+    close_5 = subset_close_races(df, threshold=0.05)
+    close_10 = subset_close_races(df, threshold=0.10)
+    non_close = df[df["riding_margin_of_victory"] >= 0.10].copy()
+
+    if close_5.shape[0] > 0:
+        run_descriptive_candidate_cue_analysis(close_5, label="CLOSE RACES (<5%)")
+
+    if close_10.shape[0] > 0:
+        run_descriptive_candidate_cue_analysis(close_10, label="CLOSE RACES (<10%)")
+
+    if non_close.shape[0] > 0:
+        run_descriptive_candidate_cue_analysis(non_close, label="NON-CLOSE RACES (>=10%)")
+
+    results = {}
+
+    if close_5["district_number"].nunique() >= 10:
+        results["close_5"] = run_candidate_models(close_5, label="CLOSE RACES (<5%)")
+
+    if close_10["district_number"].nunique() >= 10:
+        results["close_10"] = run_candidate_models(close_10, label="CLOSE RACES (<10%)")
+
+    if non_close["district_number"].nunique() >= 10:
+        results["non_close"] = run_candidate_models(non_close, label="NON-CLOSE RACES (>=10%)")
+
+    return results
+
+
+def compare_vote_share_model_r2(all_reg, close5_reg=None, close10_reg=None, nonclose_reg=None):
+    rows = []
+
+    if all_reg is not None:
+        rows.append({
+            "Subset": "All candidates",
+            "Baseline Test R2": all_reg.iloc[0]["Test R2"],
+            "Cue Test R2": all_reg.iloc[1]["Test R2"]
+        })
+
+    if close5_reg is not None:
+        rows.append({
+            "Subset": "Close <5%",
+            "Baseline Test R2": close5_reg.iloc[0]["Test R2"],
+            "Cue Test R2": close5_reg.iloc[1]["Test R2"]
+        })
+
+    if close10_reg is not None:
+        rows.append({
+            "Subset": "Close <10%",
+            "Baseline Test R2": close10_reg.iloc[0]["Test R2"],
+            "Cue Test R2": close10_reg.iloc[1]["Test R2"]
+        })
+
+    if nonclose_reg is not None:
+        rows.append({
+            "Subset": "Non-close >=10%",
+            "Baseline Test R2": nonclose_reg.iloc[0]["Test R2"],
+            "Cue Test R2": nonclose_reg.iloc[1]["Test R2"]
+        })
+
+    comp = pd.DataFrame(rows)
+    print("\n===== VOTE SHARE R2 BY RACE CLOSENESS =====")
+    print(comp.to_string(index=False))
+
+    if comp.shape[0] > 0:
+        plot_grouped_bar(
+            categories=comp["Subset"].tolist(),
+            vals1=comp["Baseline Test R2"].tolist(),
+            vals2=comp["Cue Test R2"].tolist(),
+            label1="Baseline",
+            label2="With top name cues",
+            title="Vote Share Prediction by Race Closeness",
+            ylabel="Test R^2"
+        )
+
+    comp.to_csv("candidate_cue_closeness_r2_comparison.csv", index=False)
+    return comp
+
+
+# ============================================================
+# 10. MAIN
+# ============================================================
+
+def main():
+    print("\n================ BUILD CANDIDATE-LEVEL DATASET ================\n")
+    df = build_all_candidate_dataset(ZIP_PATH)
+
+    print("\n================ ADD SAFE NAME-CUE FEATURES ================\n")
+    df = add_name_cue_features(df)
+
+    print("\n================ ALL-CANDIDATE DESCRIPTIVE ANALYSES ================\n")
+    winner_summary = winner_vs_loser_summary(df)
+    corr_summary = vote_share_correlation_summary(df)
+    rank_summary = within_riding_rank_summary(df)
+
+    print("\n================ ALL-CANDIDATE DESCRIPTIVE PLOTS ================\n")
+    make_descriptive_plots(df, winner_summary, corr_summary)
+
+    print("\n================ ALL-CANDIDATE MODELING ================\n")
+    screened, reg_comp, top5 = run_vote_share_regression(df)
+    class_comp = run_winner_classification(df, top5)
+
+    print("\n================ CLOSE-RACE ANALYSIS ================\n")
+    close_results = run_close_race_candidate_cue_analysis(df)
+
+    close5_reg = None
+    close10_reg = None
+    nonclose_reg = None
+
+    if "close_5" in close_results and close_results["close_5"] is not None:
+        close5_reg = close_results["close_5"][1]
+
+    if "close_10" in close_results and close_results["close_10"] is not None:
+        close10_reg = close_results["close_10"][1]
+
+    if "non_close" in close_results and close_results["non_close"] is not None:
+        nonclose_reg = close_results["non_close"][1]
+
+    compare_vote_share_model_r2(
+        all_reg=reg_comp,
+        close5_reg=close5_reg,
+        close10_reg=close10_reg,
+        nonclose_reg=nonclose_reg
+    )
+
+
+if __name__ == "__main__":
+    main()
