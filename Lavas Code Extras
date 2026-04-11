@@ -1,0 +1,908 @@
+import os
+import re
+import unicodedata
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from scipy.optimize import minimize
+from scipy.stats import ttest_ind
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from sklearn.pipeline import Pipeline
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.svm import SVC
+
+
+# ============================================================
+# 1. LOAD DATA
+# ============================================================
+
+def load_main_data(file_path="proj2026Dataset.csv"):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Could not find {file_path}")
+    return pd.read_csv(file_path, encoding="latin1")
+
+
+def load_statscan_data(file_path="98-401-X2021029_English_CSV_data.csv"):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Could not find {file_path}")
+    return pd.read_csv(file_path, encoding="latin1", low_memory=False)
+
+
+def normalize_text(x):
+    if pd.isna(x):
+        return np.nan
+
+    x = str(x)
+    x = unicodedata.normalize("NFKD", x)
+    x = "".join(ch for ch in x if not unicodedata.combining(ch))
+    x = x.lower().strip()
+    x = x.replace("—", "-").replace("–", "-").replace("’", "'").replace("`", "'")
+    x = x.replace("/", " ")
+    x = x.replace("-", " ")
+    x = x.replace("'", " ")
+    x = re.sub(r"[^a-z0-9\s]", " ", x)
+    x = re.sub(r"\s+", " ", x).strip()
+    return x
+
+
+# ============================================================
+# 2. VISUAL HELPERS
+# ============================================================
+
+def plot_conf_matrix_pretty(cm, class_names, title="Confusion Matrix"):
+    plt.figure(figsize=(7, 6))
+    plt.imshow(cm, interpolation="nearest", cmap="viridis")
+    plt.title(title, fontsize=14)
+    plt.colorbar()
+
+    tick_marks = np.arange(len(class_names))
+    plt.xticks(tick_marks, class_names, rotation=30, ha="right")
+    plt.yticks(tick_marks, class_names)
+
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=11)
+
+    plt.xlabel("Predicted label")
+    plt.ylabel("True label")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_horizontal_bar(labels, values, title, xlabel):
+    order = np.argsort(values)
+    labels = np.array(labels)[order]
+    values = np.array(values)[order]
+
+    plt.figure(figsize=(9, 6))
+    bars = plt.barh(labels, values)
+    plt.title(title, fontsize=14)
+    plt.xlabel(xlabel)
+
+    for bar, val in zip(bars, values):
+        plt.text(
+            val,
+            bar.get_y() + bar.get_height() / 2,
+            f" {val:.2f}",
+            va="center"
+        )
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_grouped_bar(categories, vals1, vals2, label1, label2, title, ylabel):
+    x = np.arange(len(categories))
+    width = 0.35
+
+    plt.figure(figsize=(10, 5))
+    bars1 = plt.bar(x - width / 2, vals1, width, label=label1)
+    bars2 = plt.bar(x + width / 2, vals2, width, label=label2)
+
+    plt.xticks(x, categories, rotation=30, ha="right")
+    plt.ylabel(ylabel)
+    plt.title(title, fontsize=14)
+    plt.legend()
+
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            h = bar.get_height()
+            plt.text(
+                bar.get_x() + bar.get_width() / 2,
+                h,
+                f"{h:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=9
+            )
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_metric_comparison(df, label_col, metric_col, title, ylabel):
+    labels = df[label_col].tolist()
+    values = df[metric_col].tolist()
+
+    plt.figure(figsize=(8, 4.5))
+    bars = plt.bar(labels, values)
+    plt.title(title, fontsize=14)
+    plt.ylabel(ylabel)
+    plt.xticks(rotation=20, ha="right")
+
+    for bar, val in zip(bars, values):
+        plt.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f"{val:.3f}",
+            ha="center",
+            va="bottom"
+        )
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_ethnic_boxplots(df, vars_to_plot, group_col="binary_party"):
+    for var in vars_to_plot:
+        subset = df[[group_col, var]].dropna().copy()
+        groups = []
+        labels = []
+
+        for g in subset[group_col].unique():
+            groups.append(subset.loc[subset[group_col] == g, var].values)
+            labels.append(g)
+
+        plt.figure(figsize=(6, 4.5))
+        plt.boxplot(groups, labels=labels)
+        plt.title(f"{var} by {group_col}")
+        plt.ylabel("Rate (%)")
+        plt.tight_layout()
+        plt.show()
+
+
+# ============================================================
+# 3. STATS HELPERS
+# ============================================================
+
+def cohens_d(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    x = x[~np.isnan(x)]
+    y = y[~np.isnan(y)]
+
+    if len(x) < 2 or len(y) < 2:
+        return np.nan
+
+    nx, ny = len(x), len(y)
+    sx, sy = np.var(x, ddof=1), np.var(y, ddof=1)
+
+    pooled_std = np.sqrt(((nx - 1) * sx + (ny - 1) * sy) / (nx + ny - 2))
+    if pooled_std == 0:
+        return np.nan
+
+    return (np.mean(x) - np.mean(y)) / pooled_std
+
+
+# ============================================================
+# 4. EXTRACT ETHNIC-GROUP VARIABLES ONLY
+# ============================================================
+
+def extract_ethnic_group_variables():
+    df = load_statscan_data().copy()
+
+    fed = df[df["GEO_LEVEL"].astype(str).str.contains("Federal electoral district", na=False)].copy()
+    fed["merge_name"] = fed["GEO_NAME"].apply(normalize_text)
+
+    fed = fed[[
+        "ALT_GEO_CODE",
+        "GEO_NAME",
+        "merge_name",
+        "CHARACTERISTIC_NAME",
+        "C10_RATE_TOTAL"
+    ]].copy()
+
+    fed["CHARACTERISTIC_NAME"] = fed["CHARACTERISTIC_NAME"].astype(str).str.strip()
+    fed["C10_RATE_TOTAL"] = (
+        fed["C10_RATE_TOTAL"]
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.strip()
+    )
+    fed["C10_RATE_TOTAL"] = pd.to_numeric(fed["C10_RATE_TOTAL"], errors="coerce")
+
+    wanted_labels = [
+        "Total visible minority population",
+        "Not a visible minority",
+        "South Asian",
+        "Chinese",
+        "Black",
+        "Filipino",
+        "Arab",
+        "Latin American",
+        "Southeast Asian",
+        "West Asian",
+        "Korean",
+        "Japanese",
+        "Visible minority, n.i.e.",
+        "Multiple visible minorities"
+    ]
+
+    subset = fed[fed["CHARACTERISTIC_NAME"].isin(wanted_labels)].copy()
+
+    wide = subset.pivot_table(
+        index=["ALT_GEO_CODE", "GEO_NAME", "merge_name"],
+        columns="CHARACTERISTIC_NAME",
+        values="C10_RATE_TOTAL",
+        aggfunc="first"
+    ).reset_index()
+
+    wide.columns = [str(c).strip() for c in wide.columns]
+
+    rename_map = {
+        "Total visible minority population": "rate_visible_minority",
+        "Not a visible minority": "rate_not_visible_minority",
+        "South Asian": "rate_south_asian",
+        "Chinese": "rate_chinese",
+        "Black": "rate_black",
+        "Filipino": "rate_filipino",
+        "Arab": "rate_arab",
+        "Latin American": "rate_latin_american",
+        "Southeast Asian": "rate_southeast_asian",
+        "West Asian": "rate_west_asian",
+        "Korean": "rate_korean",
+        "Japanese": "rate_japanese",
+        "Visible minority, n.i.e.": "rate_visible_minority_nie",
+        "Multiple visible minorities": "rate_multiple_visible_minorities"
+    }
+
+    wide = wide.rename(columns=rename_map)
+
+    print("\n===== EXTRACTED ETHNIC-GROUP VARIABLES =====")
+    print("Rows:", wide.shape[0])
+    print("Columns:", len(wide.columns))
+    print(wide.head())
+
+    return wide
+
+
+def merge_main_and_ethnic():
+    main_df = load_main_data().copy()
+    ethnic_df = extract_ethnic_group_variables().copy()
+
+    main_df["merge_name"] = main_df["Constituency"].apply(normalize_text)
+
+    merged = main_df.merge(ethnic_df, on="merge_name", how="left", indicator=True)
+
+    print("\n===== MERGE SUMMARY =====")
+    print(merged["_merge"].value_counts(dropna=False))
+
+    return merged
+
+
+# ============================================================
+# 5. PARTY PROFILE VISUALS
+# ============================================================
+
+def run_ethnic_profile_visuals():
+    merged = merge_main_and_ethnic().copy()
+    ethnic_cols = [c for c in merged.columns if c.startswith("rate_")]
+
+    party_profile = merged.groupby("Political Affiliation")[ethnic_cols].mean().round(3)
+    print("\n===== PARTY ETHNIC PROFILE TABLE =====")
+    print(party_profile)
+
+    lib_non = merged.copy()
+    lib_non["binary_party"] = np.where(
+        lib_non["Political Affiliation"] == "Liberal",
+        "Liberal",
+        "Non-Liberal"
+    )
+    lib_non_profile = lib_non.groupby("binary_party")[ethnic_cols].mean().round(3)
+
+    print("\n===== LIBERAL VS NON-LIBERAL ETHNIC PROFILE =====")
+    print(lib_non_profile)
+
+    preferred_vars = [
+        "rate_visible_minority",
+        "rate_not_visible_minority",
+        "rate_south_asian",
+        "rate_chinese",
+        "rate_black",
+        "rate_arab"
+    ]
+    available_vars = [v for v in preferred_vars if v in lib_non_profile.columns]
+
+    if len(available_vars) > 0:
+        plot_grouped_bar(
+            categories=available_vars,
+            vals1=lib_non_profile.loc["Liberal", available_vars].tolist(),
+            vals2=lib_non_profile.loc["Non-Liberal", available_vars].tolist(),
+            label1="Liberal",
+            label2="Non-Liberal",
+            title="Ethnic-Group Profile: Liberal vs Non-Liberal Ridings",
+            ylabel="Average rate (%)"
+        )
+
+    party_profile.to_csv("party_ethnic_profile_table.csv")
+    lib_non_profile.to_csv("liberal_vs_nonliberal_ethnic_profile.csv")
+
+    return party_profile, lib_non_profile
+
+
+# ============================================================
+# 6. BFGS HELPERS
+# ============================================================
+
+def softplus_stable(z):
+    z = np.asarray(z, dtype=float)
+    return np.maximum(z, 0.0) + np.log1p(np.exp(-np.abs(z)))
+
+
+def sigmoid_stable(z):
+    z = np.asarray(z, dtype=float)
+    out = np.empty_like(z, dtype=float)
+    pos = z >= 0
+    neg = ~pos
+    out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+    ez = np.exp(z[neg])
+    out[neg] = ez / (1.0 + ez)
+    return out
+
+
+def svm_objective_smooth(params, X, y, lambda_reg=0.01, alpha=20.0):
+    w = params[:-1]
+    b = params[-1]
+    scores = X @ w + b
+    margins = 1 - y * scores
+    z = alpha * margins
+    smooth_hinge = softplus_stable(z) / alpha
+    return np.mean(smooth_hinge) + lambda_reg * np.sum(w ** 2)
+
+
+def svm_gradient_smooth(params, X, y, lambda_reg=0.01, alpha=20.0):
+    w = params[:-1]
+    b = params[-1]
+    scores = X @ w + b
+    margins = 1 - y * scores
+    z = alpha * margins
+    sigma = sigmoid_stable(z)
+    grad_w = -(X.T @ (sigma * y)) / X.shape[0] + 2 * lambda_reg * w
+    grad_b = -np.mean(sigma * y)
+    return np.append(grad_w, grad_b)
+
+
+def preprocess_data(X_train, X_val, degree=3):
+    poly = PolynomialFeatures(degree=degree, include_bias=False)
+    X_train_poly = poly.fit_transform(X_train)
+    X_val_poly = poly.transform(X_val)
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_poly)
+    X_val_scaled = scaler.transform(X_val_poly)
+
+    return X_train_scaled, X_val_scaled
+
+
+def train_svm_bfgs(X_train, y_train, lambda_reg=0.01, maxiter=200):
+    init_params = np.zeros(X_train.shape[1] + 1)
+    result = minimize(
+        fun=svm_objective_smooth,
+        x0=init_params,
+        args=(X_train, y_train, lambda_reg),
+        jac=svm_gradient_smooth,
+        method="BFGS",
+        options={"maxiter": maxiter, "disp": False}
+    )
+    return result
+
+
+def predict_bfgs(params, X):
+    w = params[:-1]
+    b = params[-1]
+    scores = X @ w + b
+    return np.where(scores >= 0, 1, -1)
+
+
+# ============================================================
+# 7. TRAIN-ONLY SCREENING FOR ETHNIC GROUPS
+# ============================================================
+
+def screen_ethnic_variables_on_training(train_df, candidate_cols):
+    train_df = train_df.copy()
+    train_df["is_liberal"] = (train_df["Political Affiliation"] == "Liberal").astype(int)
+
+    rows = []
+    for col in candidate_cols:
+        x = pd.to_numeric(train_df[col], errors="coerce")
+        mask = x.notna()
+
+        if mask.sum() < 20:
+            continue
+
+        lib_vals = x[(train_df["is_liberal"] == 1) & mask]
+        non_vals = x[(train_df["is_liberal"] == 0) & mask]
+
+        if len(lib_vals) < 5 or len(non_vals) < 5:
+            continue
+
+        mean_lib = lib_vals.mean()
+        mean_non = non_vals.mean()
+        diff = mean_lib - mean_non
+
+        t_stat, p_val = ttest_ind(lib_vals, non_vals, equal_var=False, nan_policy="omit")
+
+        rows.append({
+            "variable": col,
+            "mean_liberal": mean_lib,
+            "mean_non_liberal": mean_non,
+            "difference": diff,
+            "abs_difference": abs(diff),
+            "p_value": p_val
+        })
+
+    results = pd.DataFrame(rows).sort_values(["abs_difference", "p_value"], ascending=[False, True])
+    return results
+
+
+def plot_top_ethnic_variables(screened_df, top_n=10):
+    top = screened_df.head(top_n).copy()
+    plot_horizontal_bar(
+        labels=top["variable"].tolist(),
+        values=top["abs_difference"].tolist(),
+        title=f"Top {top_n} Ethnic-Group Variables by Liberal vs Non-Liberal Difference",
+        xlabel="Absolute mean difference"
+    )
+
+
+def plot_liberal_vs_nonliberal_ethnic_profile(screened_df, top_n=8):
+    top = screened_df.head(top_n).copy()
+    plot_grouped_bar(
+        categories=top["variable"].tolist(),
+        vals1=top["mean_liberal"].tolist(),
+        vals2=top["mean_non_liberal"].tolist(),
+        label1="Liberal",
+        label2="Non-Liberal",
+        title="Ethnic-Group Profile: Liberal vs Non-Liberal Ridings",
+        ylabel="Average rate (%)"
+    )
+
+
+def ethnic_distribution_summary(merged, top_vars):
+    df = merged.copy()
+    df["binary_party"] = np.where(
+        df["Political Affiliation"] == "Liberal",
+        "Liberal",
+        "Non-Liberal"
+    )
+
+    rows = []
+
+    for var in top_vars:
+        lib = pd.to_numeric(df.loc[df["binary_party"] == "Liberal", var], errors="coerce").dropna()
+        non = pd.to_numeric(df.loc[df["binary_party"] == "Non-Liberal", var], errors="coerce").dropna()
+
+        if len(lib) < 5 or len(non) < 5:
+            continue
+
+        t_stat, p_val = ttest_ind(lib, non, equal_var=False, nan_policy="omit")
+        d = cohens_d(lib, non)
+
+        rows.append({
+            "variable": var,
+            "liberal_mean": lib.mean(),
+            "non_liberal_mean": non.mean(),
+            "liberal_median": lib.median(),
+            "non_liberal_median": non.median(),
+            "liberal_q1": lib.quantile(0.25),
+            "liberal_q3": lib.quantile(0.75),
+            "non_liberal_q1": non.quantile(0.25),
+            "non_liberal_q3": non.quantile(0.75),
+            "mean_difference": lib.mean() - non.mean(),
+            "p_value": p_val,
+            "cohens_d": d
+        })
+
+    summary = pd.DataFrame(rows).sort_values("p_value")
+    print("\n===== ETHNIC DISTRIBUTION SUMMARY =====")
+    print(summary.to_string(index=False))
+
+    summary.to_csv("ethnic_distribution_summary.csv", index=False)
+    return summary
+
+
+def run_ethnic_distribution_analysis():
+    merged = merge_main_and_ethnic().copy()
+    merged["binary_party"] = np.where(
+        merged["Political Affiliation"] == "Liberal",
+        "Liberal",
+        "Non-Liberal"
+    )
+
+    ethnic_cols = [c for c in merged.columns if c.startswith("rate_")]
+
+    preferred_vars = [
+        "rate_visible_minority",
+        "rate_not_visible_minority",
+        "rate_south_asian",
+        "rate_chinese",
+        "rate_black",
+        "rate_arab"
+    ]
+    top_vars = [v for v in preferred_vars if v in ethnic_cols]
+
+    profile = merged.groupby("binary_party")[top_vars].mean().round(3)
+    print("\n===== ETHNIC PROFILE (MEANS) =====")
+    print(profile)
+
+    summary = ethnic_distribution_summary(merged, top_vars)
+    plot_ethnic_boxplots(merged, top_vars, group_col="binary_party")
+
+    return profile, summary
+
+
+# ============================================================
+# 8. FEATURE BUILDERS
+# ============================================================
+
+def build_binary_baseline_X(df):
+    df = df.copy()
+    df["target"] = np.where(df["Political Affiliation"] == "Liberal", 1, -1)
+
+    drop_cols = [
+        "Political Affiliation",
+        "target",
+        "riding",
+        "Constituency",
+        "Province / Territory",
+        "First Name",
+        "Last Name",
+        "merge_name",
+        "ALT_GEO_CODE",
+        "GEO_NAME",
+        "_merge"
+    ] + [c for c in df.columns if c.startswith("rate_")]
+
+    X = df.drop(columns=drop_cols, errors="ignore")
+    X = X.select_dtypes(include=[np.number])
+    y = df["target"].values
+    return X, y
+
+
+def build_binary_subset_X(df, chosen_vars):
+    df = df.copy()
+    df["target"] = np.where(df["Political Affiliation"] == "Liberal", 1, -1)
+
+    drop_cols = [
+        "Political Affiliation",
+        "target",
+        "riding",
+        "Constituency",
+        "Province / Territory",
+        "First Name",
+        "Last Name",
+        "merge_name",
+        "ALT_GEO_CODE",
+        "GEO_NAME",
+        "_merge"
+    ]
+
+    for c in df.columns:
+        if c.startswith("rate_") and c not in chosen_vars:
+            drop_cols.append(c)
+
+    X = df.drop(columns=drop_cols, errors="ignore")
+    X = X.select_dtypes(include=[np.number])
+    y = df["target"].values
+    return X, y
+
+
+def build_multiclass_baseline_X(df):
+    df = df.copy()
+    keep_parties = ["Liberal", "Conservative", "Bloc Québécois"]
+    df = df[df["Political Affiliation"].isin(keep_parties)].copy()
+
+    drop_cols = [
+        "Political Affiliation",
+        "riding",
+        "Constituency",
+        "Province / Territory",
+        "First Name",
+        "Last Name",
+        "merge_name",
+        "ALT_GEO_CODE",
+        "GEO_NAME",
+        "_merge"
+    ] + [c for c in df.columns if c.startswith("rate_")]
+
+    X = df.drop(columns=drop_cols, errors="ignore")
+    X = X.select_dtypes(include=[np.number])
+    y = df["Political Affiliation"].astype(str).values
+    return df, X, y
+
+
+def build_multiclass_subset_X(df, chosen_vars):
+    df = df.copy()
+    keep_parties = ["Liberal", "Conservative", "Bloc Québécois"]
+    df = df[df["Political Affiliation"].isin(keep_parties)].copy()
+
+    drop_cols = [
+        "Political Affiliation",
+        "riding",
+        "Constituency",
+        "Province / Territory",
+        "First Name",
+        "Last Name",
+        "merge_name",
+        "ALT_GEO_CODE",
+        "GEO_NAME",
+        "_merge"
+    ]
+
+    for c in df.columns:
+        if c.startswith("rate_") and c not in chosen_vars:
+            drop_cols.append(c)
+
+    X = df.drop(columns=drop_cols, errors="ignore")
+    X = X.select_dtypes(include=[np.number])
+    y = df["Political Affiliation"].astype(str).values
+    return df, X, y
+
+
+# ============================================================
+# 9. BINARY ETHNIC-GROUP NO-LEAKAGE
+# ============================================================
+
+def run_binary_ethnic_no_leakage():
+    merged = merge_main_and_ethnic().copy()
+
+    train_df, test_df = train_test_split(
+        merged,
+        test_size=0.25,
+        stratify=np.where(merged["Political Affiliation"] == "Liberal", 1, -1),
+        random_state=42
+    )
+
+    ethnic_cols = [c for c in merged.columns if c.startswith("rate_")]
+    screened = screen_ethnic_variables_on_training(train_df, ethnic_cols)
+
+    print("\n===== TOP ETHNIC-GROUP VARIABLES (TRAINING ONLY) =====")
+    print(screened.head(15).to_string(index=False))
+
+    top5 = screened.head(5)["variable"].tolist()
+    print("\nSelected top ethnic-group variables from training only:")
+    print(top5)
+
+    plot_top_ethnic_variables(screened, top_n=10)
+    plot_liberal_vs_nonliberal_ethnic_profile(screened, top_n=8)
+
+    # baseline
+    X_train_base, y_train_base = build_binary_baseline_X(train_df)
+    X_test_base, y_test_base = build_binary_baseline_X(test_df)
+
+    common_base_cols = sorted(set(X_train_base.columns).intersection(X_test_base.columns))
+    X_train_base = X_train_base[common_base_cols]
+    X_test_base = X_test_base[common_base_cols]
+
+    # ethnic subset
+    X_train_sub, y_train_sub = build_binary_subset_X(train_df, top5)
+    X_test_sub, y_test_sub = build_binary_subset_X(test_df, top5)
+
+    common_sub_cols = sorted(set(X_train_sub.columns).intersection(X_test_sub.columns))
+    X_train_sub = X_train_sub[common_sub_cols]
+    X_test_sub = X_test_sub[common_sub_cols]
+
+    # remove missing rows separately
+    base_train_mask = ~X_train_base.isna().any(axis=1)
+    base_test_mask = ~X_test_base.isna().any(axis=1)
+    X_train_base = X_train_base.loc[base_train_mask]
+    X_test_base = X_test_base.loc[base_test_mask]
+    y_train_base = y_train_base[base_train_mask.to_numpy()]
+    y_test_base = y_test_base[base_test_mask.to_numpy()]
+
+    sub_train_mask = ~X_train_sub.isna().any(axis=1)
+    sub_test_mask = ~X_test_sub.isna().any(axis=1)
+    X_train_sub = X_train_sub.loc[sub_train_mask]
+    X_test_sub = X_test_sub.loc[sub_test_mask]
+    y_train_sub = y_train_sub[sub_train_mask.to_numpy()]
+    y_test_sub = y_test_sub[sub_test_mask.to_numpy()]
+
+    def run_one(Xtr, Xte, ytr, yte, label):
+        Xtr_scaled, Xte_scaled = preprocess_data(Xtr.values, Xte.values, degree=3)
+        result = train_svm_bfgs(Xtr_scaled, ytr, lambda_reg=0.01, maxiter=200)
+
+        ytr_pred = predict_bfgs(result.x, Xtr_scaled)
+        yte_pred = predict_bfgs(result.x, Xte_scaled)
+
+        train_acc = accuracy_score(ytr, ytr_pred)
+        test_acc = accuracy_score(yte, yte_pred)
+        cm = confusion_matrix(yte, yte_pred)
+
+        print(f"\n===== {label} =====")
+        print("Training Accuracy:", round(train_acc, 4))
+        print("Testing Accuracy:", round(test_acc, 4))
+        print("\nConfusion Matrix:")
+        print(cm)
+        print("\nClassification Report:")
+        print(classification_report(yte, yte_pred, zero_division=0))
+
+        plot_conf_matrix_pretty(
+            cm,
+            class_names=["Non-Liberal", "Liberal"],
+            title=label + " Confusion Matrix"
+        )
+
+        return {
+            "Model": label,
+            "Train Accuracy": train_acc,
+            "Test Accuracy": test_acc,
+            "Train Rows": len(ytr),
+            "Test Rows": len(yte)
+        }
+
+    baseline_results = run_one(
+        X_train_base, X_test_base, y_train_base, y_test_base,
+        "Binary Baseline BFGS"
+    )
+
+    ethnic_results = run_one(
+        X_train_sub, X_test_sub, y_train_sub, y_test_sub,
+        "Binary BFGS + Top 5 Ethnic-Group Variables"
+    )
+
+    comparison = pd.DataFrame([baseline_results, ethnic_results])
+    print("\n===== BINARY ETHNIC-GROUP NO-LEAKAGE COMPARISON =====")
+    print(comparison.to_string(index=False))
+
+    plot_metric_comparison(
+        comparison,
+        label_col="Model",
+        metric_col="Test Accuracy",
+        title="Binary Model Comparison (Ethnic-Group Variables)",
+        ylabel="Test Accuracy"
+    )
+
+    comparison.to_csv("binary_ethnic_no_leakage_comparison.csv", index=False)
+    screened.to_csv("binary_ethnic_training_only_screened_variables.csv", index=False)
+
+    return screened, comparison, top5
+
+
+# ============================================================
+# 10. MULTICLASS ETHNIC-GROUP NO-LEAKAGE
+# ============================================================
+
+def run_multiclass_ethnic_no_leakage(top5_vars):
+    merged = merge_main_and_ethnic().copy()
+    keep_parties = ["Liberal", "Conservative", "Bloc Québécois"]
+    merged = merged[merged["Political Affiliation"].isin(keep_parties)].copy()
+
+    train_df, test_df = train_test_split(
+        merged,
+        test_size=0.25,
+        stratify=merged["Political Affiliation"],
+        random_state=42
+    )
+
+    # baseline
+    _, X_train_base, y_train_base = build_multiclass_baseline_X(train_df)
+    _, X_test_base, y_test_base = build_multiclass_baseline_X(test_df)
+
+    common_base_cols = sorted(set(X_train_base.columns).intersection(X_test_base.columns))
+    X_train_base = X_train_base[common_base_cols]
+    X_test_base = X_test_base[common_base_cols]
+
+    # ethnic subset
+    _, X_train_sub, y_train_sub = build_multiclass_subset_X(train_df, top5_vars)
+    _, X_test_sub, y_test_sub = build_multiclass_subset_X(test_df, top5_vars)
+
+    common_sub_cols = sorted(set(X_train_sub.columns).intersection(X_test_sub.columns))
+    X_train_sub = X_train_sub[common_sub_cols]
+    X_test_sub = X_test_sub[common_sub_cols]
+
+    # remove missing rows separately
+    base_train_mask = ~X_train_base.isna().any(axis=1)
+    base_test_mask = ~X_test_base.isna().any(axis=1)
+    X_train_base = X_train_base.loc[base_train_mask]
+    X_test_base = X_test_base.loc[base_test_mask]
+    y_train_base = y_train_base[base_train_mask.to_numpy()]
+    y_test_base = y_test_base[base_test_mask.to_numpy()]
+
+    sub_train_mask = ~X_train_sub.isna().any(axis=1)
+    sub_test_mask = ~X_test_sub.isna().any(axis=1)
+    X_train_sub = X_train_sub.loc[sub_train_mask]
+    X_test_sub = X_test_sub.loc[sub_test_mask]
+    y_train_sub = y_train_sub[sub_train_mask.to_numpy()]
+    y_test_sub = y_test_sub[sub_test_mask.to_numpy()]
+
+    def run_one(Xtr, Xte, ytr, yte, label):
+        clf = Pipeline([
+            ("scaler", StandardScaler()),
+            ("svc", OneVsRestClassifier(
+                SVC(kernel="rbf", C=1.0, gamma="scale")
+            ))
+        ])
+
+        clf.fit(Xtr, ytr)
+        ytr_pred = clf.predict(Xtr)
+        yte_pred = clf.predict(Xte)
+
+        train_acc = accuracy_score(ytr, ytr_pred)
+        test_acc = accuracy_score(yte, yte_pred)
+
+        labels = sorted(pd.Series(np.concatenate([ytr, yte])).unique())
+        cm = confusion_matrix(yte, yte_pred, labels=labels)
+
+        print(f"\n===== {label} =====")
+        print("Training Accuracy:", round(train_acc, 4))
+        print("Testing Accuracy:", round(test_acc, 4))
+        print("\nConfusion Matrix:")
+        print(cm)
+        print("\nClassification Report:")
+        print(classification_report(yte, yte_pred, zero_division=0))
+
+        plot_conf_matrix_pretty(
+            cm,
+            class_names=labels,
+            title=label + " Confusion Matrix"
+        )
+
+        return {
+            "Model": label,
+            "Train Accuracy": train_acc,
+            "Test Accuracy": test_acc,
+            "Train Rows": len(ytr),
+            "Test Rows": len(yte)
+        }
+
+    baseline_results = run_one(
+        X_train_base, X_test_base, y_train_base, y_test_base,
+        "Multiclass Baseline"
+    )
+
+    ethnic_results = run_one(
+        X_train_sub, X_test_sub, y_train_sub, y_test_sub,
+        "Multiclass + Top 5 Ethnic-Group Variables"
+    )
+
+    comparison = pd.DataFrame([baseline_results, ethnic_results])
+    print("\n===== MULTICLASS ETHNIC-GROUP NO-LEAKAGE COMPARISON =====")
+    print(comparison.to_string(index=False))
+
+    plot_metric_comparison(
+        comparison,
+        label_col="Model",
+        metric_col="Test Accuracy",
+        title="Multiclass Model Comparison (Ethnic-Group Variables)",
+        ylabel="Test Accuracy"
+    )
+
+    comparison.to_csv("multiclass_ethnic_no_leakage_comparison.csv", index=False)
+    return comparison
+
+
+# ============================================================
+# 11. MAIN
+# ============================================================
+
+def main():
+    print("\n================ ETHNIC PROFILE VISUALS =================\n")
+    run_ethnic_profile_visuals()
+
+    print("\n================ ETHNIC DISTRIBUTION ANALYSIS =================\n")
+    run_ethnic_distribution_analysis()
+
+    print("\n================ BINARY ETHNIC-GROUP NO-LEAKAGE =================\n")
+    screened, binary_comparison, top5 = run_binary_ethnic_no_leakage()
+
+    print("\n================ MULTICLASS ETHNIC-GROUP NO-LEAKAGE =================\n")
+    multiclass_comparison = run_multiclass_ethnic_no_leakage(top5)
+
+
+if __name__ == "__main__":
+    main()
